@@ -1,0 +1,138 @@
+name: Build and Deploy Backend
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  repository_dispatch:
+    types: [frontend-updated]   # 👈 ADD THIS
+
+env:
+  FRONTEND_REPO: MeridianAI-AKS/meridianai-stockpulse-frontend   # frontend repo (owner/name)
+  FRONTEND_CHECKOUT_PATH: frontend                              # where frontend will be checked out
+  FRONTEND_BUILD_DIR: dist                                      # change to 'dist' if your frontend outputs to dist/
+  BACKEND_STATIC_DIR: public                                    # change to where backend serves static files
+  IMAGE_NAME: backend                                           # name of image inside ACR (adjust)
+  ACR_LOGIN_SERVER: ${{ secrets.ACR_NAME }}.azurecr.io          # requires secret ACR_NAME
+  WEBAPP_NAME: ${{ secrets.WEBAPP_NAME }}  
+  ACR_NAME: ${{ secrets.ACR_NAME }}
+  CONTAINER_NAME : main                    # App Service name, stored in repo secrets
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      ################################################################
+      # 1) Checkout backend repo (where this workflow lives)
+      ################################################################
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      ################################################################
+      # 2) Checkout frontend repo into subfolder
+      #    If your frontend is private and not accessible by GITHUB_TOKEN,
+      #    provide a PAT stored in secrets.FRONTEND_REPO_TOKEN
+      ################################################################
+      - name: Checkout frontend repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FRONTEND_REPO }}
+          path: ${{ env.FRONTEND_CHECKOUT_PATH }}
+          token: ${{ secrets.FRONTEND_REPO_TOKEN || github.token }}
+          fetch-depth: 0
+  
+      ################################################################
+      # 3) Build frontend
+      #    Adjust to your frontend toolchain (npm/yarn/pnpm)
+      ################################################################
+      - name: Build frontend
+        working-directory: ${{ env.FRONTEND_CHECKOUT_PATH }}
+        run: |
+          set -e
+          echo "Installing frontend dependencies..."
+          npm ci
+          echo "Running frontend build..."
+          npm run build
+        # Optional: cache node_modules with actions/cache (not shown for brevity)
+  
+      ################################################################
+      # 4) Copy built static files into backend static directory
+      #    Ensure BACKEND_STATIC_DIR matches your backend (e.g. public/ or src/main/resources/static/)
+      ################################################################
+      - name: Copy frontend build into backend static directory
+        run: |
+          set -e
+          echo "Preparing backend static dir: ${{ env.BACKEND_STATIC_DIR }}"
+          # create target dir if missing
+          mkdir -p "${{ env.BACKEND_STATIC_DIR }}"
+          # remove existing static content (careful: keep this intentional)
+          rm -rf "${{ env.BACKEND_STATIC_DIR }}"/*
+          # copy build files
+          cp -a "${{ env.FRONTEND_CHECKOUT_PATH }}/${{ env.FRONTEND_BUILD_DIR }}/." "${{ env.BACKEND_STATIC_DIR }}/"
+          echo "Files copied. Confirming list:"
+          ls -la "${{ env.BACKEND_STATIC_DIR }}"
+
+      ################################################################
+      # 6) Login to Azure (Service Principal)
+      #    Requires AZURE_CREDENTIALS secret (service principal JSON)
+      ################################################################
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      ################################################################
+      # 7) Login to ACR (Docker) so we can push images
+      ################################################################
+      - name: Log in to ACR
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.ACR_NAME }}.azurecr.io
+          username: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
+          password: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
+
+      ################################################################
+      # 8) Build & push Docker image (tagged with commit sha + latest)
+      ################################################################
+      - name: Build and Push Docker Image
+        run: |
+          docker build -t ${{ env.ACR_NAME }}.azurecr.io/${{ env.CONTAINER_NAME }}:${{ github.sha }} .
+          docker push ${{ env.ACR_NAME }}.azurecr.io/${{ env.CONTAINER_NAME }}:${{ github.sha }}
+
+      ################################################################
+      # 9) Ensure Web App has system-assigned identity and AcrPull role
+      #    Requires secrets.AZURE_RG (resource group containing the Web App)
+      ################################################################
+      - name: Assign AcrPull Permission
+        run: |
+          if [ -z "${{ secrets.ACR_RG }}" ]; then
+            echo "ERROR: ACR_RG secret is not set in GitHub Secrets."
+            exit 1
+          fi
+          # Enable Managed Identity for the Web App
+          az webapp identity assign --name ${{ env.WEBAPP_NAME }} --resource-group ${{ secrets.ACR_RG }}
+          
+          # Get the Principal ID of the Web App's Managed Identity
+          PRINCIPAL_ID=$(az webapp identity show --name ${{ env.WEBAPP_NAME }} --resource-group ${{ secrets.ACR_RG }} --query principalId -o tsv)
+          
+          # Get the Resource ID of the ACR
+          ACR_ID=$(az acr show --name ${{ env.ACR_NAME }} --query id -o tsv)
+          
+          # Assign AcrPull role to the Web App's identity on the ACR
+          az role assignment create --assignee $PRINCIPAL_ID --scope $ACR_ID --role AcrPull || true
+  
+      ################################################################
+      # 10) Deploy to Azure Web App
+      #     Uses the container image from ACR
+      ################################################################
+      - name: Deploy to Azure Web App
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{ env.WEBAPP_NAME }}
+          images: ${{ env.ACR_NAME }}.azurecr.io/${{ env.CONTAINER_NAME }}:${{ github.sha }}
+          
